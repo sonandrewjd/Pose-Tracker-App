@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pose Tracker & Feedback System (V3)</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 
+        *** FIX: Reverting to non-versioned, standard CDN links for stability. ***
+        This usually resolves issues where specific version sub-paths block the loading of worker assets.
+    -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js"></script>
+
+    <style>
+        /* Custom styles for the app */
+        body { font-family: 'Inter', sans-serif; }
+        .webcam-container {
+            position: relative;
+            width: 100%;
+            max-width: 800px;
+            margin: 0 auto;
+            border-radius: 1rem;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            overflow: hidden;
+        }
+        video, canvas {
+            display: block;
+            width: 100%;
+            height: auto;
+            border-radius: 1rem;
+            /* Use transform for mirroring (simulates looking into a mirror) */
+            transform: scaleX(-1);
+        }
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 10;
+        }
+        #video-feed {
+            visibility: hidden; /* Hide the raw video, only show the canvas */
+        }
+        .text-overlay {
+            z-index: 20;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen p-4 sm:p-8">
+
+    <div class="max-w-4xl mx-auto">
+        <h1 class="text-3xl sm:text-4xl font-extrabold text-gray-900 mb-6 text-center">
+            Real-Time Pose Tracker
+        </h1>
+
+        <!-- Webcam and Canvas Container -->
+        <div class="webcam-container mb-6">
+            <video id="video-feed" class="w-full" autoplay playsinline></video>
+            <canvas id="pose-canvas" class="w-full"></canvas>
+            
+            <!-- Loading and Status Overlay -->
+            <div id="loading-overlay" class="absolute inset-0 bg-gray-900 bg-opacity-70 flex items-center justify-center transition-opacity duration-500 text-overlay">
+                <div class="text-center text-white p-4">
+                    <svg id="loading-spinner" class="animate-spin h-8 w-8 text-white mx-auto mb-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    <p id="loading-message" class="text-lg font-medium">Loading dependencies...</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Feedback Area -->
+        <div id="feedback" class="p-4 rounded-xl border transition-colors duration-300 text-sm bg-blue-100 text-blue-800 border-blue-300 mb-6 font-medium">
+            Awaiting MediaPipe and system initialization.
+        </div>
+
+        <!-- Controls -->
+        <div class="flex justify-center">
+            <button id="start-button" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-xl shadow-lg transition-all duration-200 transform hover:scale-105 focus:outline-none focus:ring-4 focus:ring-indigo-500 focus:ring-opacity-50 disabled:bg-gray-400" disabled>
+                Start Pose Tracking
+            </button>
+        </div>
+    </div>
+
+    <script type="module">
+        // --- Firebase/Authentication Boilerplate (Mandatory Setup) ---
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables provided by the Canvas environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db, auth;
+        let isAuthReady = false;
+
+        async function initializeFirebase() {
+            try {
+                if (firebaseConfig) {
+                    const app = initializeApp(firebaseConfig);
+                    db = getFirestore(app);
+                    auth = getAuth(app);
+                    setLogLevel('debug');
+
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                    
+                    isAuthReady = true;
+                    console.log("Firebase initialized.");
+                } else {
+                    console.error("Firebase config not available. Running client-side only.");
+                    isAuthReady = true;
+                }
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                updateFeedback("Initialization error. Check console for details.", 'error');
+            } finally {
+                // IMPORTANT: Check for MediaPipe readiness after Firebase finishes
+                checkMediaPipeReadiness();
+            }
+        }
+        // --- End of Firebase Boilerplate ---
+
+
+        // --- POSE TRACKER LOGIC ---
+
+        const videoElement = document.getElementById('video-feed');
+        const canvasElement = document.getElementById('pose-canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const loadingOverlay = document.getElementById('loading-overlay');
+        const loadingMessage = document.getElementById('loading-message');
+        const loadingSpinner = document.getElementById('loading-spinner');
+        const startButton = document.getElementById('start-button');
+        
+        let camera;
+        let pose = null; // Pose instance
+        let isTracking = false;
+        let retryCount = 0;
+        const MAX_RETRIES = 15; // Max attempts (15 * 500ms = 7.5 seconds)
+
+        /**
+         * @description Updates the feedback message displayed to the user.
+         * @param {string} message - The text message to display.
+         * @param {string} type - The type of message ('info', 'success', 'error').
+         */
+        function updateFeedback(message, type = 'info') {
+            const feedbackDiv = document.getElementById('feedback');
+            if (!feedbackDiv) return;
+
+            // Reset classes
+            feedbackDiv.className = 'p-4 rounded-xl border transition-colors duration-300 text-sm font-medium mb-6';
+
+            if (type === 'error') {
+                feedbackDiv.classList.add('bg-red-100', 'text-red-800', 'border-red-300');
+            } else if (type === 'success') {
+                feedbackDiv.classList.add('bg-green-100', 'text-green-800', 'border-green-300');
+            } else {
+                // 'info' or default
+                feedbackDiv.classList.add('bg-blue-100', 'text-blue-800', 'border-blue-300');
+            }
+
+            feedbackDiv.innerHTML = message;
+        }
+        
+        /**
+         * @description Checks if MediaPipe utilities are loaded and enables the button.
+         */
+        function checkMediaPipeReadiness() {
+            // Check if MediaPipe globals are available on the window object
+            if (typeof window.Camera === 'function' && typeof window.Pose === 'function') {
+                
+                // Initialize the Pose object now that window.Pose is guaranteed to exist
+                pose = new window.Pose({locateFile: (file) => {
+                    // FIX: Using the non-versioned CDN path for locating worker assets (was causing issues before)
+                    return `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`;
+                }});
+
+                pose.setOptions({
+                    modelComplexity: 1,
+                    smoothLandmarks: true,
+                    minDetectionConfidence: 0.5,
+                    minTrackingConfidence: 0.5
+                });
+
+                // Attach the results handler
+                pose.onResults(onResults);
+                
+                // Everything is ready, enable the button
+                startButton.disabled = false;
+                loadingMessage.textContent = 'MediaPipe loaded.';
+                updateFeedback("System ready. Click 'Start Pose Tracking' to begin.", 'info');
+            } else if (retryCount < MAX_RETRIES) {
+                // If not ready, wait a bit and try again (Handles the race condition)
+                retryCount++;
+                loadingMessage.textContent = `Loading dependencies... (Attempt ${retryCount}/${MAX_RETRIES})`;
+                console.warn(`MediaPipe utilities not yet loaded. Retrying in 500ms... Attempt ${retryCount}`);
+                setTimeout(checkMediaPipeReadiness, 500); // Increased delay
+            } else {
+                // Critical failure after max retries
+                startButton.disabled = true;
+                loadingSpinner.style.display = 'none';
+                loadingMessage.textContent = 'Critical Load Error: MediaPipe libraries could not be loaded. Check your network or browser console.';
+                updateFeedback("Critical Error: Core tracking libraries failed to load after several attempts. Camera access cannot proceed.", 'error');
+            }
+        }
+
+
+        // Callback function run every frame after pose estimation is complete
+        function onResults(results) {
+            // Hide loading overlay once the first result comes in
+            if (loadingOverlay.style.opacity !== '0') {
+                loadingOverlay.style.opacity = '0';
+                loadingOverlay.style.pointerEvents = 'none';
+                videoElement.style.visibility = 'visible';
+                
+            }
+
+            // Set canvas size to match the video feed size
+            const videoWidth = videoElement.videoWidth;
+            const videoHeight = videoElement.videoHeight;
+            canvasElement.width = videoWidth;
+            canvasElement.height = videoHeight;
+
+            canvasCtx.save();
+            // IMPORTANT: Clear the canvas before drawing the new frame
+            canvasCtx.clearRect(0, 0, videoWidth, videoHeight);
+            
+            // Draw the mirrored video frame (since the CSS transform flips the video)
+            canvasCtx.drawImage(results.image, 0, 0, videoWidth, videoHeight);
+            
+            // Draw landmarks and connections
+            if (results.poseLandmarks) {
+                // 1. Draw connections (lines)
+                // Use window.drawConnectors and window.POSE_CONNECTIONS directly
+                window.drawConnectors(canvasCtx, results.poseLandmarks, window.POSE_CONNECTIONS, {color: '#00FF00', lineWidth: 4});
+                
+                // 2. Draw landmarks (dots)
+                window.drawLandmarks(canvasCtx, results.poseLandmarks, {color: '#FF0000', lineWidth: 2});
+
+                // Simple check for body visibility
+                const visibilitySum = results.poseLandmarks.reduce((sum, landmark) => sum + landmark.visibility, 0);
+                const averageVisibility = visibilitySum / results.poseLandmarks.length;
+
+                if (averageVisibility < 0.3) {
+                     updateFeedback("Can't see your pose clearly. Try moving back or ensuring better lighting.", 'info');
+                } else {
+                    updateFeedback("Pose detected. Maintain visibility for accurate tracking.", 'success');
+                }
+            }
+
+            canvasCtx.restore();
+        }
+
+
+        /**
+         * @description Initializes the camera and starts the tracking loop.
+         */
+        function startTracking() {
+            // We check if pose exists before calling this function, but double-check for safety.
+            if (isTracking || !pose) return; 
+
+            isTracking = true;
+
+            startButton.disabled = true;
+            startButton.textContent = 'Tracking Active...';
+            startButton.classList.remove('bg-indigo-600', 'hover:bg-indigo-700');
+            startButton.classList.add('bg-green-600', 'hover:bg-green-700');
+
+            updateFeedback("Initializing camera...", 'info');
+
+            // Use window.Camera directly to access the global constructor
+            camera = new window.Camera(videoElement, {
+                onFrame: async () => {
+                    await pose.send({image: videoElement});
+                },
+                width: 640,
+                height: 480
+            });
+            camera.start();
+        }
+
+        // --- Event Listeners and Initial Load ---
+        
+        window.onload = () => {
+            initializeFirebase(); // Kicks off Firebase init, which then calls checkMediaPipeReadiness
+            startButton.addEventListener('click', startTracking);
+        };
+    </script>
+</body>
+</html>
+
+
+
+
